@@ -7,6 +7,10 @@ Translation-pipeline evaluation (text only: no ASR, no TTS).
   (rater fills the 'Correct (Y/N)' column with Y or N)
   python eval_translation.py run --retry-failed
         -> re-runs ONLY rows whose status is FAIL (keeps good rows and your ratings)
+  python eval_translation.py setup
+        -> installs the Argos hi<->en and es<->en language packs (do this once)
+  python eval_translation.py probe
+        -> sends ONE online request to check whether Google is still blocking you
   python eval_translation.py analyze
         -> results/figs/*.png, results/summary.csv, results/failure_examples.csv
 
@@ -131,9 +135,24 @@ def offline_translate(tr, text, tgt):
     return format_translation(out) if tgt == "en" else out   # same as app
 
 
+ONLINE_BACKEND = "gtx"   # "gtx" (default) or "deep" (what the app calls); set by --backend
+
+
 def online_translate(src, tgt, text):
-    from deep_translator import GoogleTranslator
-    return GoogleTranslator(source=src, target=tgt).translate(text)  # app applies no formatting
+    """App applies no post-formatting to online output, so none is applied here either."""
+    if ONLINE_BACKEND == "deep":
+        from deep_translator import GoogleTranslator
+        return GoogleTranslator(source=src, target=tgt).translate(text)
+    # Same Google Translate service, different unofficial endpoint. deep_translator's endpoint
+    # (translate.google.com/m) was returning HTTP 429 for every request, while this one works.
+    import requests
+    r = requests.get("https://translate.googleapis.com/translate_a/single",
+                     params={"client": "gtx", "sl": src, "tl": tgt, "dt": "t", "q": text},
+                     timeout=15)
+    if r.status_code == 429:
+        raise RuntimeError("TooManyRequests: HTTP 429 too many requests")
+    r.raise_for_status()
+    return "".join(seg[0] for seg in r.json()[0] if seg and seg[0])
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +262,11 @@ def run(trials, online_trials, delay, retry_failed):
 
     os.makedirs(OUT_DIR, exist_ok=True)
     offline = build_offline()
+    missing = [f"{a}->{b}" for a, b in DIRECTIONS if (a, b) not in offline]
+    if missing and not retry_failed:
+        print(f"Argos models missing for: {', '.join(missing)}\n"
+              f"Run:  python {sys.argv[0]} setup   (once), then run again.")
+        sys.exit(1)
     prev_rows, prev_trials = load_previous() if retry_failed else ({}, [])
 
     print("Measuring network...")
@@ -254,6 +278,13 @@ def run(trials, online_trials, delay, retry_failed):
 
     new_rows, new_trials = {}, []
     state = {"consec": 0, "dead": False}   # circuit breaker for online throttling
+    try:   # single un-retried request: if Google is blocking us, skip online immediately
+        online_call("en", "es", "test", max_attempts=1)
+    except Exception as e:
+        state["dead"] = True
+        print(f"\n!! Online probe failed ({type(e).__name__}): Google is blocking this IP.\n"
+              "   Online rows will be marked FAIL (skipped). Wait / switch network, then:\n"
+              "   python eval_translation.py run --retry-failed\n")
     skip_msg = "SKIPPED: online throttled; rerun with --retry-failed later"
 
     for (src, tgt) in DIRECTIONS:
@@ -270,7 +301,7 @@ def run(trials, online_trials, delay, retry_failed):
                     offline_translate(offline[(src, tgt)], "test", tgt)
                 elif mode == "ONLINE" and not state["dead"]:
                     pace(delay)
-                    online_call(src, tgt, "test")
+                    online_call(src, tgt, "test", max_attempts=1)
             except Exception:
                 pass
 
@@ -375,6 +406,7 @@ def run(trials, online_trials, delay, retry_failed):
         ("trials_per_sentence_offline", trials),
         ("trials_per_sentence_online", online_trials),
         ("online_request_spacing_s", f"{delay} + up to {0.5*delay} jitter"),
+        ("online_backend", ONLINE_BACKEND),
         ("ran_with_retry_failed", retry_failed),
         ("ping_ms_mean", round(np.mean(ping), 1) if ping else "n/a"),
         ("ping_ms_sd", round(np.std(ping, ddof=1), 1) if len(ping) > 1 else "n/a"),
@@ -532,15 +564,53 @@ def analyze():
     print(f"\nFigures in {FIG_DIR}/, summary.csv and failure_examples.csv in {OUT_DIR}/")
 
 
+def setup_models():
+    """Download + install the Argos language packs needed for the four directions."""
+    import argostranslate.package as pkg
+    have = build_offline()
+    todo = [d for d in DIRECTIONS if d not in have]
+    if not todo:
+        print("All Argos models already installed.")
+        return
+    pkg.update_package_index()
+    avail = pkg.get_available_packages()
+    for a, b in todo:
+        p = next((x for x in avail if x.from_code == a and x.to_code == b), None)
+        if p is None:
+            print(f"No Argos package found for {a}->{b}")
+            continue
+        print(f"Installing {a}->{b} ...")
+        pkg.install_from_path(p.download())
+    print("Done. Now run: run")
+
+
+def probe():
+    """One online request, no retries: tells you whether Google is currently blocking this IP."""
+    print("One Google Translate request...")
+    try:
+        out, ms = online_call("en", "es", "Hello, how are you?", max_attempts=1)
+        print(f"OK: '{out}' in {ms:.0f} ms -> online mode should work now. Run: run --retry-failed")
+    except Exception as e:
+        print(f"STILL BLOCKED: {type(e).__name__}: {str(e)[:150]}")
+        print("Wait longer or switch network (e.g. phone hotspot), then probe again.")
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("phase", choices=["run", "analyze"])
+    ap.add_argument("phase", choices=["run", "analyze", "probe", "setup"])
     ap.add_argument("--trials", type=int, default=5, help="trials per sentence, OFFLINE mode")
     ap.add_argument("--online-trials", type=int, default=3, help="trials per sentence, ONLINE mode")
     ap.add_argument("--delay", type=float, default=2.0, help="seconds between online requests (+50%% jitter)")
+    ap.add_argument("--backend", choices=["gtx", "deep"], default="gtx",
+                    help="online endpoint: gtx (default, works) or deep (deep_translator, as in the app)")
     ap.add_argument("--retry-failed", action="store_true", help="re-run only rows whose status is FAIL")
     a = ap.parse_args()
+    ONLINE_BACKEND = a.backend
     if a.phase == "run":
         run(a.trials, a.online_trials, a.delay, a.retry_failed)
+    elif a.phase == "probe":
+        probe()
+    elif a.phase == "setup":
+        setup_models()
     else:
         analyze()

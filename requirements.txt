@@ -1,0 +1,8 @@
+argostranslate
+deep-translator
+openpyxl
+pandas
+matplotlib
+numpy
+sacrebleu
+certifi
