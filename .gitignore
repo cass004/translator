@@ -1,7 +1,1 @@
-venv/
-__pycache__/
-*.onnx
-vosk-model-*/
-piper/
-piper_windows_amd64/
-.DS_Store
+.venv
